@@ -103,6 +103,7 @@ def place_symbols(
     min_dist_factor: float,
     max_rotation: float,
     rng: random.Random,
+    symbol_padding: float = 4.0,
 ) -> List[Tuple[float, float, float, float]]:
     """Return list of (x, y, size, rotation_deg) for `count` symbols.
 
@@ -114,10 +115,13 @@ def place_symbols(
     `margin` px, regardless of where it is placed.
 
     Inter-symbol spacing is enforced by rejecting candidates closer than
-    `min_dist_factor * avg_size` (relaxed if the layout genuinely can't fit).
-    Sizes are uniform-random in [min_size, max_size]; rotation uniform in
+    `(size + other_size) / 2 + symbol_padding` — a hard non-overlap
+    constraint — plus `min_dist_factor * avg_size`, which is relaxed if the
+    layout genuinely can't fit. The hard padding is never relaxed. Sizes are
+    uniform-random in [min_size, max_size]; rotation uniform in
     [-max_rotation, max_rotation].
     """
+    symbol_padding = max(0.0, symbol_padding)
     R = card_size / 2.0
     cx = cy = R
     keepout = margin + max_size / 2.0
@@ -145,7 +149,8 @@ def place_symbols(
             y = cy + rad * math.sin(ang)
             ok = True
             for px, py, ps, _ in placed:
-                if math.hypot(x - px, y - py) < min_dist + (size + ps) / 2 * 0.55:
+                clear = (size + ps) / 2.0 + symbol_padding
+                if math.hypot(x - px, y - py) < min_dist + clear:
                     ok = False
                     break
             if ok:
@@ -154,19 +159,23 @@ def place_symbols(
                 success = True
                 break
         if not success:
-            # can't fit with current inter-symbol spacing -> relax it and retry
-            min_dist *= 0.85
-            placed = []
-            if min_dist < 0.05 * base_min_dist:
-                if min_dist == 0.0:
+            # can't fit with current spacing -> relax only the soft spacing
+            if min_dist == 0.0:
+                if attempts_per_point >= 4000:
                     raise ValueError(
                         f"Could not place {count} symbols of size "
                         f"[{min_size},{max_size}] on a {card_size}px card with "
-                        f"margin {margin}. Reduce --order, --max-size, or raise "
-                        f"--card-px."
+                        f"margin {margin} and padding {symbol_padding}px. "
+                        f"Reduce --order, --max-size, or --symbol-padding, or "
+                        f"raise --card-px."
                     )
-                min_dist = 0.0
                 attempts_per_point = 4000
+            else:
+                min_dist *= 0.85
+                if min_dist < 0.05 * base_min_dist:
+                    min_dist = 0.0
+                    attempts_per_point = 4000
+            placed = []
 
     return placed
 
@@ -277,7 +286,7 @@ HTML_TEMPLATE = """<!doctype html>
     margin: 0;
     font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji",
                  "Twemoji Mozilla", "EmojiOne Color", sans-serif;
-    background: #eee;
+    background: {card_bg};
     display: flex; flex-wrap: wrap; gap: 8px;
     padding: 8px;
   }}
@@ -289,7 +298,7 @@ HTML_TEMPLATE = """<!doctype html>
     border: {border};
     border-radius: 50%;
     overflow: hidden;
-    box-shadow: 0 2px 6px rgba(0,0,0,.25);
+    box-shadow: {card_shadow};
     break-inside: avoid;
   }}
   .sym {{
@@ -304,8 +313,17 @@ HTML_TEMPLATE = """<!doctype html>
     object-fit: contain;
     -webkit-user-drag: none;
   }}
+  /* cutting guide: sits on top of the symbols, marks the exact card center */
+  .center-dot {{
+    position: absolute;
+    left: 50%; top: 50%;
+    width: {dot_px}px; height: {dot_px}px;
+    margin: {dot_offset_px}px 0 0 {dot_offset_px}px;
+    border-radius: 50%;
+    background: {dot_color};
+  }}
   @media print {{
-    body {{ background: #fff; gap: 0; padding: 0; }}
+    body {{ gap: 0; padding: 0; }}
     .card {{ box-shadow: none; }}
     /* keep image/background colors when printing */
     * {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
@@ -340,6 +358,8 @@ def render_card_html(
     min_dist_factor: float,
     max_rotation: float,
     rng: random.Random,
+    center_dot: bool = True,
+    symbol_padding: float = 4.0,
 ) -> str:
     placements = place_symbols(
         count=len(card_indices),
@@ -350,6 +370,7 @@ def render_card_html(
         min_dist_factor=min_dist_factor,
         max_rotation=max_rotation,
         rng=rng,
+        symbol_padding=symbol_padding,
     )
     # shuffle which symbol goes to which slot so the layout isn't tied to index order
     order = list(range(len(card_indices)))
@@ -358,6 +379,8 @@ def render_card_html(
     for slot, idx in enumerate(order):
         x, y, size, rot = placements[slot]
         parts.append(render_symbol_html(symbol_map[card_indices[idx]], x, y, size, rot))
+    if center_dot:
+        parts.append('<div class="center-dot"></div>')
     return f'<div class="card">{"".join(parts)}</div>'
 
 
@@ -378,6 +401,8 @@ def build_html(
             min_dist_factor=cfg.min_dist,
             max_rotation=cfg.max_rotation,
             rng=rng,
+            center_dot=cfg.center_dot > 0,
+            symbol_padding=cfg.symbol_padding,
         )
         for card in cards
     )
@@ -390,7 +415,12 @@ def build_html(
         page_margin_mm=10,
         card_px=cfg.card_px,
         card_bg=cfg.card_bg,
-        border=cfg.card_border,
+        border="none" if cfg.borderless else cfg.card_border,
+        # the on-screen shadow would still draw a card outline, so drop it too
+        card_shadow="none" if cfg.borderless else "0 2px 6px rgba(0,0,0,.25)",
+        dot_px=f"{cfg.center_dot:.2f}",
+        dot_offset_px=f"{-cfg.center_dot / 2:.2f}",
+        dot_color=cfg.center_dot_color,
         cards_html=cards_html,
     )
 
@@ -421,11 +451,21 @@ def parse_args() -> argparse.Namespace:
                     help="empty band inside the round card edge, in px; symbols "
                          "are kept fully inside the circle by at least this much")
     ap.add_argument("--min-dist", type=float, default=0.35,
-                    help="min spacing between symbols as a fraction of avg size")
+                    help="extra spacing between symbols as a fraction of avg size")
+    ap.add_argument("--symbol-padding", type=float, default=4.0,
+                    help="hard minimum empty gap between symbol boxes in px; "
+                         "never relaxed, so symbols cannot overlap (default 4.0)")
     ap.add_argument("--max-rotation", type=float, default=180.0,
                     help="max rotation in degrees (symmetric +/-)")
+    ap.add_argument("--center-dot", type=float, default=3.0,
+                    help="diameter in px of the gray dot marking the card center "
+                         "(cutting guide); 0 disables it")
+    ap.add_argument("--center-dot-color", default="#9a9a9a",
+                    help="color of the center dot")
     ap.add_argument("--card-bg", default="#fffdf5", help="card background color")
     ap.add_argument("--card-border", default="3px solid #d9c9a3", help="card border CSS")
+    ap.add_argument("--borderless", action="store_true",
+                    help="draw cards with no border (overrides --card-border)")
     return ap.parse_args()
 
 
